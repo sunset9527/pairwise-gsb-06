@@ -1,0 +1,15 @@
+{
+  "ignoreBinaries": ["gh"],
+  "workspaces": {
+    ".": {},
+    "packages/vscode": {
+      "entry": [
+        "src/extension.ts",
+        "src/server-entry.ts",
+        "src/watcher-shim.ts",
+        "src/open-stub.ts"
+      ],
+      "ignoreUnresolved": ["#parcel-watcher-wrapper"]
+    }
+  }
+}

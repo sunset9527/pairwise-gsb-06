@@ -1,0 +1,869 @@
+import { simpleGit, type SimpleGit } from 'simple-git';
+import { isAbsolute, resolve, sep } from 'path';
+
+import { validateDiffArguments, shortHash, createCommitRangeString } from '../cli/utils.js';
+import {
+  type DiffChunk,
+  type DiffFile,
+  type DiffLine,
+  type DiffResponse,
+  type DiffSelection,
+} from '../types/diff.js';
+import { getMergeBaseTargetRef, normalizeBaseMode } from '../utils/diffSelection.js';
+
+import { isGeneratedFile } from './generated-file-check.js';
+
+export class GitDiffParser {
+  private git: SimpleGit;
+  private repoPath: string;
+  private readonly resolvedCommitCache = new Map<string, { value: string; expiresAt: number }>();
+  private static readonly RESOLVED_COMMIT_CACHE_TTL_MS = 5_000;
+  private static readonly GENERATED_HEADER_SCAN_BYTES = 4 * 1024;
+  private static readonly GITATTRIBUTES_CHECK_CHUNK_SIZE = 200;
+
+  constructor(repoPath = process.cwd()) {
+    this.repoPath = repoPath;
+    this.git = simpleGit(repoPath);
+  }
+
+  private normalizeRepositoryRelativePath(filepath: string): string {
+    if (filepath.length === 0) {
+      throw new Error('Invalid file path');
+    }
+
+    const normalizedFilepath = filepath.replace(/\\/g, '/');
+    const hasParentTraversal = normalizedFilepath.split('/').some((segment) => segment === '..');
+    if (isAbsolute(filepath) || normalizedFilepath.startsWith('/') || hasParentTraversal) {
+      throw new Error('File path outside repository');
+    }
+
+    const repositoryPath = resolve(this.repoPath);
+    const resolvedPath = resolve(repositoryPath, normalizedFilepath);
+    if (resolvedPath !== repositoryPath && !resolvedPath.startsWith(`${repositoryPath}${sep}`)) {
+      throw new Error('File path outside repository');
+    }
+
+    return normalizedFilepath;
+  }
+
+  private async resolveBaseCommitish(selection: DiffSelection): Promise<string> {
+    if (normalizeBaseMode(selection.baseMode) !== 'merge-base') {
+      return selection.baseCommitish;
+    }
+
+    const targetRef = getMergeBaseTargetRef(selection.targetCommitish);
+    const mergeBase = await this.git.raw(['merge-base', targetRef, selection.baseCommitish]);
+    return mergeBase.trim();
+  }
+
+  async parseDiff(
+    selection: DiffSelection,
+    ignoreWhitespace = false,
+    contextLines?: number,
+  ): Promise<DiffResponse> {
+    const { targetCommitish, baseCommitish } = selection;
+    const requestedBaseMode =
+      normalizeBaseMode(selection.baseMode) === 'merge-base' ? 'merge-base' : undefined;
+
+    try {
+      // Validate arguments
+      const validation = validateDiffArguments(targetCommitish, baseCommitish);
+      if (!validation.valid) {
+        throw new Error(validation.error);
+      }
+
+      const effectiveBaseCommitish = await this.resolveBaseCommitish(selection);
+      let resolvedCommit: string;
+      let diffArgs: string[];
+      let resolvedBaseCommitish = effectiveBaseCommitish;
+      let resolvedTargetCommitish = targetCommitish;
+      let attributesRef = targetCommitish;
+
+      // Handle target special chars (base is always a regular commit)
+      if (targetCommitish === 'working') {
+        // Show unstaged changes (working vs staged)
+        resolvedCommit = 'Working Directory (unstaged changes)';
+        diffArgs = [];
+      } else if (targetCommitish === 'staged') {
+        // Show staged changes against base commit
+        const baseHash = await this.git.revparse([effectiveBaseCommitish]);
+        resolvedCommit = `${shortHash(baseHash)} vs Staging Area (staged changes)`;
+        resolvedBaseCommitish = shortHash(baseHash);
+        diffArgs = ['--cached', effectiveBaseCommitish];
+      } else if (targetCommitish === '.') {
+        // Show all uncommitted changes against base commit
+        const baseHash = await this.git.revparse([effectiveBaseCommitish]);
+        resolvedCommit = `${shortHash(baseHash)} vs Working Directory (all uncommitted changes)`;
+        resolvedBaseCommitish = shortHash(baseHash);
+        diffArgs = [effectiveBaseCommitish];
+      } else {
+        // Both are regular commits: standard commit-to-commit comparison
+        const targetHash = await this.git.revparse([targetCommitish]);
+        const baseHash = await this.git.revparse([effectiveBaseCommitish]);
+        resolvedCommit = createCommitRangeString(shortHash(baseHash), shortHash(targetHash));
+        resolvedBaseCommitish = shortHash(baseHash);
+        resolvedTargetCommitish = shortHash(targetHash);
+        attributesRef = targetHash;
+        diffArgs = [baseHash, targetHash];
+      }
+
+      if (ignoreWhitespace) {
+        diffArgs.push('-w');
+      }
+
+      if (contextLines !== undefined) {
+        diffArgs.push(`-U${contextLines}`);
+      }
+
+      // Ignore external diff-tools to unify output.
+      // https://github.com/yoshiko-pg/difit/issues/19
+      diffArgs.push('--no-ext-diff', '--color=never');
+
+      // Single git invocation for better startup latency on large repositories.
+      const diffRaw = await this.git.diff(diffArgs);
+      const files = await this.markGitattributesGeneratedFiles(
+        this.parseUnifiedDiff(diffRaw),
+        attributesRef,
+      );
+
+      return {
+        commit: resolvedCommit,
+        files,
+        isEmpty: files.length === 0,
+        baseCommitish: resolvedBaseCommitish,
+        targetCommitish: resolvedTargetCommitish,
+        requestedBaseCommitish: baseCommitish,
+        requestedTargetCommitish: targetCommitish,
+        requestedBaseMode,
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to parse diff for ${targetCommitish} vs ${baseCommitish}: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+    }
+  }
+
+  private parseUnifiedDiff(diffText: string): DiffFile[] {
+    const files: DiffFile[] = [];
+    const fileBlocks = diffText.split(/^diff --git /m).slice(1);
+
+    if (fileBlocks.length > 0) {
+      for (const fileBlock of fileBlocks) {
+        const block = `diff --git ${fileBlock}`;
+        const file = this.parseFileBlock(block);
+        if (file) {
+          files.push(file);
+        }
+      }
+
+      return files;
+    }
+
+    for (const fileBlock of this.splitPlainUnifiedDiff(diffText)) {
+      const file = this.parseFileBlock(fileBlock, 'plain');
+      if (file) {
+        files.push(file);
+      }
+    }
+
+    return files;
+  }
+
+  private splitPlainUnifiedDiff(diffText: string): string[] {
+    const lines = diffText.split(/\r?\n/);
+    const blocks: string[] = [];
+    let blockStart: number | null = null;
+    let remainingOldLines = 0;
+    let remainingNewLines = 0;
+
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index];
+
+      if (blockStart !== null && line.startsWith('@@')) {
+        const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+        if (match) {
+          remainingOldLines = parseInt(match[2] ?? '1');
+          remainingNewLines = parseInt(match[4] ?? '1');
+        }
+        continue;
+      }
+
+      if (blockStart !== null && (remainingOldLines > 0 || remainingNewLines > 0)) {
+        if (line.startsWith('\\')) {
+          continue;
+        }
+        if (line.startsWith('+')) {
+          remainingNewLines--;
+        } else if (line.startsWith('-')) {
+          remainingOldLines--;
+        } else if (line.startsWith(' ')) {
+          remainingOldLines--;
+          remainingNewLines--;
+        }
+        continue;
+      }
+
+      if (line.startsWith('--- ') && lines[index + 1]?.startsWith('+++ ')) {
+        if (blockStart !== null) {
+          blocks.push(lines.slice(blockStart, index).join('\n'));
+        }
+        blockStart = index;
+      }
+    }
+
+    if (blockStart !== null) {
+      blocks.push(lines.slice(blockStart).join('\n'));
+    }
+
+    return blocks;
+  }
+
+  private getGitattributesSourceArgs(ref: string): string[] {
+    if (ref === 'working' || ref === '.') {
+      return [];
+    }
+
+    if (ref === 'staged') {
+      return ['--cached'];
+    }
+
+    return ['--source', ref];
+  }
+
+  private parseGitattributesGeneratedOutput(output: string): Set<string> {
+    const generatedPaths = new Set<string>();
+    const fields = output.split('\0');
+
+    for (let i = 0; i + 2 < fields.length; i += 3) {
+      const [path, attribute, value] = fields.slice(i, i + 3);
+      if (attribute === 'linguist-generated' && value === 'true') {
+        generatedPaths.add(path);
+      }
+    }
+
+    return generatedPaths;
+  }
+
+  private async getGitattributesGeneratedPaths(
+    filepaths: string[],
+    ref: string,
+  ): Promise<Set<string>> {
+    if (filepaths.length === 0) {
+      return new Set();
+    }
+
+    const generatedPaths = new Set<string>();
+
+    try {
+      for (let i = 0; i < filepaths.length; i += GitDiffParser.GITATTRIBUTES_CHECK_CHUNK_SIZE) {
+        const chunk = filepaths.slice(i, i + GitDiffParser.GITATTRIBUTES_CHECK_CHUNK_SIZE);
+        const output = await this.git.raw([
+          'check-attr',
+          '-z',
+          ...this.getGitattributesSourceArgs(ref),
+          'linguist-generated',
+          '--',
+          ...chunk,
+        ]);
+
+        if (typeof output !== 'string') {
+          continue;
+        }
+
+        for (const path of this.parseGitattributesGeneratedOutput(output)) {
+          generatedPaths.add(path);
+        }
+      }
+
+      return generatedPaths;
+    } catch {
+      return new Set();
+    }
+  }
+
+  private async markGitattributesGeneratedFiles(
+    files: DiffFile[],
+    ref: string,
+  ): Promise<DiffFile[]> {
+    const candidates = files.filter((file) => !file.isGenerated).map((file) => file.path);
+    const generatedPaths = await this.getGitattributesGeneratedPaths(candidates, ref);
+
+    if (generatedPaths.size === 0) {
+      return files;
+    }
+
+    return files.map((file) =>
+      generatedPaths.has(file.path) ? { ...file, isGenerated: true } : file,
+    );
+  }
+
+  private decodeGitPath(
+    rawPath: string | undefined,
+    stripGitPrefix: boolean = true,
+  ): string | undefined {
+    if (typeof rawPath !== 'string') {
+      return undefined;
+    }
+
+    const tabIndex = rawPath.indexOf('\t');
+    const pathWithoutTimestamp = tabIndex === -1 ? rawPath : rawPath.slice(0, tabIndex);
+    const trimmed =
+      pathWithoutTimestamp.startsWith('"') && pathWithoutTimestamp.endsWith('"')
+        ? pathWithoutTimestamp.slice(1, -1)
+        : pathWithoutTimestamp;
+
+    const gitPrefixes = ['a/', 'b/', 'c/', 'i/', 'w/'];
+    let withoutPrefix = trimmed;
+    if (stripGitPrefix) {
+      for (const prefix of gitPrefixes) {
+        if (withoutPrefix.startsWith(prefix)) {
+          withoutPrefix = withoutPrefix.slice(prefix.length);
+          break;
+        }
+      }
+    }
+
+    if (withoutPrefix === '/dev/null') {
+      return undefined;
+    }
+
+    const bytes: number[] = [];
+    for (let i = 0; i < withoutPrefix.length; i++) {
+      const char = withoutPrefix[i];
+
+      if (char === '\\' && i + 1 < withoutPrefix.length) {
+        const next = withoutPrefix[i + 1];
+
+        if (/[0-7]/.test(next)) {
+          let octal = next;
+          let read = 1;
+
+          while (read < 3 && i + 1 + read < withoutPrefix.length) {
+            const candidate = withoutPrefix[i + 1 + read];
+            if (!/[0-7]/.test(candidate)) {
+              break;
+            }
+            octal += candidate;
+            read++;
+          }
+
+          bytes.push(parseInt(octal, 8));
+          i += read; // Skip consumed digits
+          continue;
+        }
+
+        switch (next) {
+          case 't':
+            bytes.push(0x09);
+            break;
+          case 'n':
+            bytes.push(0x0a);
+            break;
+          case 'r':
+            bytes.push(0x0d);
+            break;
+          case 'b':
+            bytes.push(0x08);
+            break;
+          case 'f':
+            bytes.push(0x0c);
+            break;
+          case 'v':
+            bytes.push(0x0b);
+            break;
+          case 'a':
+            bytes.push(0x07);
+            break;
+          case '\\':
+            bytes.push(0x5c);
+            break;
+          case '"':
+            bytes.push(0x22);
+            break;
+          case ' ':
+            bytes.push(0x20);
+            break;
+          default:
+            bytes.push(...Buffer.from(next, 'utf8'));
+            break;
+        }
+        i++; // Skip the escaped character
+        continue;
+      }
+
+      bytes.push(...Buffer.from(char, 'utf8'));
+    }
+
+    return Buffer.from(bytes).toString('utf8');
+  }
+
+  private extractPathFromLine(
+    line: string | undefined,
+    prefix: string,
+    stripGitPrefix: boolean = true,
+  ): string | undefined {
+    if (!line?.startsWith(prefix)) {
+      return undefined;
+    }
+
+    return this.decodeGitPath(line.slice(prefix.length), stripGitPrefix);
+  }
+
+  private parseDiffHeaderPaths(
+    headerLine: string,
+  ): { oldPath: string | undefined; newPath: string | undefined } | null {
+    if (!headerLine.startsWith('diff --git ')) {
+      return null;
+    }
+
+    const raw = headerLine.slice('diff --git '.length);
+    const segments: string[] = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < raw.length; i++) {
+      const char = raw[i];
+      const prevChar = i > 0 ? raw[i - 1] : null;
+
+      if (char === '"' && prevChar !== '\\') {
+        inQuotes = !inQuotes;
+        current += char;
+        continue;
+      }
+
+      if (char === ' ' && !inQuotes && prevChar !== '\\') {
+        if (current) {
+          segments.push(current);
+          current = '';
+        }
+        continue;
+      }
+
+      current += char;
+    }
+
+    if (current) {
+      segments.push(current);
+    }
+
+    if (segments.length !== 2) {
+      return null;
+    }
+
+    const [rawOldPath, rawNewPath] = segments;
+    return {
+      oldPath: this.decodeGitPath(rawOldPath),
+      newPath: this.decodeGitPath(rawNewPath),
+    };
+  }
+
+  private parseFileBlock(block: string, format: 'git' | 'plain' | null = 'git'): DiffFile | null {
+    const lines = block.split('\n');
+    const headerLine = lines[0];
+    const headerPaths = this.parseDiffHeaderPaths(headerLine);
+
+    const minusLine = lines.find((line) => line.startsWith('--- '));
+    const plusLine = lines.find((line) => line.startsWith('+++ '));
+    const renameFromLine = lines.find((line) => line.startsWith('rename from '));
+    const renameToLine = lines.find((line) => line.startsWith('rename to '));
+
+    const stripGitPrefix = format !== 'plain';
+    const plusPath = this.extractPathFromLine(plusLine, '+++ ', stripGitPrefix);
+    const minusPath = this.extractPathFromLine(minusLine, '--- ', stripGitPrefix);
+    const renameFromPath = this.extractPathFromLine(renameFromLine, 'rename from ');
+    const renameToPath = this.extractPathFromLine(renameToLine, 'rename to ');
+    const parsedNewPath = renameToPath ?? plusPath ?? headerPaths?.newPath;
+    const parsedOldPath = renameFromPath ?? minusPath ?? headerPaths?.oldPath;
+    const newPath = parsedNewPath ?? parsedOldPath;
+    const oldPath = parsedOldPath ?? newPath;
+
+    if (!newPath) {
+      return null;
+    }
+
+    const path = newPath;
+
+    let status: DiffFile['status'] = 'modified';
+
+    // Check for new file mode (added files)
+    const newFileMode = lines.find((line) => line.startsWith('new file mode'));
+    const deletedFileMode = lines.find((line) => line.startsWith('deleted file mode'));
+
+    // Check for /dev/null which indicates added or deleted files
+    if (newFileMode || minusLine?.includes('/dev/null')) {
+      status = 'added';
+    } else if (deletedFileMode || plusLine?.includes('/dev/null')) {
+      status = 'deleted';
+    } else if (format !== 'plain' && oldPath !== newPath) {
+      status = 'renamed';
+    }
+
+    // Common properties for all files
+    const baseFile = {
+      path,
+      oldPath: status === 'renamed' && oldPath !== newPath ? oldPath : undefined,
+      status,
+    };
+
+    // Parse chunks
+    const chunks = this.parseChunks(lines);
+
+    const { additions, deletions } = this.countLinesFromChunks(chunks);
+    return {
+      ...baseFile,
+      additions,
+      deletions,
+      chunks,
+      isGenerated: isGeneratedFile(path).isGenerated,
+    };
+  }
+
+  private countLinesFromChunks(chunks: DiffChunk[]): {
+    additions: number;
+    deletions: number;
+  } {
+    let additions = 0;
+    let deletions = 0;
+    for (const chunk of chunks) {
+      for (const line of chunk.lines) {
+        if (line.type === 'add') additions++;
+        else if (line.type === 'delete') deletions++;
+      }
+    }
+    return { additions, deletions };
+  }
+
+  private parseChunks(lines: string[]): DiffChunk[] {
+    const chunks: DiffChunk[] = [];
+    let currentChunk: DiffChunk | null = null;
+    let oldLineNum = 0;
+    let newLineNum = 0;
+
+    for (const line of lines) {
+      if (line.startsWith('@@')) {
+        if (currentChunk) {
+          chunks.push(currentChunk);
+        }
+
+        const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)/);
+        if (match) {
+          const oldStart = parseInt(match[1]);
+          const oldLines = parseInt(match[2] || '1');
+          const newStart = parseInt(match[3]);
+          const newLines = parseInt(match[4] || '1');
+
+          oldLineNum = oldStart;
+          newLineNum = newStart;
+
+          currentChunk = {
+            header: line,
+            oldStart,
+            oldLines,
+            newStart,
+            newLines,
+            lines: [],
+          };
+        }
+      } else if (
+        currentChunk &&
+        (line.startsWith('+') || line.startsWith('-') || line.startsWith(' '))
+      ) {
+        const type = line.startsWith('+') ? 'add' : line.startsWith('-') ? 'delete' : 'normal';
+
+        const diffLine: DiffLine = {
+          type,
+          content: line.slice(1),
+          oldLineNumber: type !== 'add' ? oldLineNum : undefined,
+          newLineNumber: type !== 'delete' ? newLineNum : undefined,
+        };
+
+        currentChunk.lines.push(diffLine);
+
+        if (type !== 'add') oldLineNum++;
+        if (type !== 'delete') newLineNum++;
+      }
+    }
+
+    if (currentChunk) {
+      chunks.push(currentChunk);
+    }
+
+    return chunks;
+  }
+
+  async validateCommit(commitish: string): Promise<boolean> {
+    try {
+      if (commitish === '.' || commitish === 'working' || commitish === 'staged') {
+        // For working directory or staging area, just check if we're in a git repo
+        await this.git.status();
+        return true;
+      }
+      await this.git.show([commitish, '--name-only']);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  parseStdinDiff(diffContent: string): DiffResponse {
+    const files = this.parseUnifiedDiff(diffContent);
+
+    return {
+      commit: 'stdin diff',
+      files,
+      isEmpty: files.length === 0,
+    };
+  }
+
+  async getBlobContent(filepath: string, ref: string): Promise<Buffer> {
+    try {
+      // For working directory, read directly from filesystem
+      if (ref === 'working' || ref === '.') {
+        const fs = await import('fs');
+        if (filepath.length === 0) {
+          throw new Error('Invalid file path');
+        }
+
+        const repositoryPath = fs.realpathSync(resolve(this.repoPath));
+        const repositoryRoot = `${repositoryPath}${sep}`;
+        const absolutePath = fs.realpathSync(resolve(repositoryRoot, filepath.replace(/\\/g, '/')));
+
+        if (!absolutePath.startsWith(repositoryRoot)) {
+          throw new Error('File path outside repository');
+        }
+
+        return fs.readFileSync(absolutePath);
+      }
+
+      const normalizedFilepath = this.normalizeRepositoryRelativePath(filepath);
+
+      // For git refs, we need to use child_process to execute git cat-file
+      // to properly handle binary data
+      const { execFileSync } = await import('child_process');
+
+      // Handle staged files
+      if (ref === 'staged') {
+        // For staged files, use git show :filepath
+        // Using execFileSync to prevent command injection
+        const buffer = execFileSync('git', ['show', `:${normalizedFilepath}`], {
+          maxBuffer: 10 * 1024 * 1024, // 10MB limit
+        });
+        return buffer;
+      }
+
+      // First, get the blob hash for the file at the given ref
+      // Using execFileSync to prevent command injection
+      const blobHash = execFileSync('git', ['rev-parse', `${ref}:${normalizedFilepath}`], {
+        encoding: 'utf8',
+        maxBuffer: 10 * 1024 * 1024,
+      }).trim();
+
+      // Then use git cat-file to get the raw binary content
+      // Increase maxBuffer to handle large files (default is 1024*1024 = 1MB)
+      const buffer = execFileSync('git', ['cat-file', 'blob', blobHash], {
+        maxBuffer: 10 * 1024 * 1024, // 10MB limit
+      });
+
+      return buffer;
+    } catch (error) {
+      // Check if it's a buffer size error
+      if (
+        error instanceof Error &&
+        (error.message.includes('ENOBUFS') || error.message.includes('maxBuffer'))
+      ) {
+        throw new Error(`Image file ${filepath} is too large to display (over 10MB limit)`);
+      }
+
+      if (
+        error instanceof Error &&
+        (error.message === 'Invalid file path' || error.message === 'File path outside repository')
+      ) {
+        throw error;
+      }
+
+      throw new Error(
+        `Failed to get blob content for ${filepath} at ${ref}: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+    }
+  }
+
+  async getLineCount(filepath: string, ref: string): Promise<number> {
+    const buffer = await this.getBlobContent(filepath, ref);
+    let count = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      if (buffer[i] === 0x0a) count++; // newline byte
+    }
+    // If file doesn't end with newline, the last line still counts
+    if (buffer.length > 0 && buffer[buffer.length - 1] !== 0x0a) {
+      count++;
+    }
+    return count;
+  }
+
+  private extractHeaderLines(buffer: Buffer, maxLines = 20): string[] {
+    const headerSlice = buffer.subarray(0, GitDiffParser.GENERATED_HEADER_SCAN_BYTES);
+    return headerSlice.toString('utf8').split('\n').slice(0, maxLines);
+  }
+
+  async getGeneratedStatus(
+    filepath: string,
+    ref: string,
+  ): Promise<{ isGenerated: boolean; source: 'path' | 'content' }> {
+    const pathResult = isGeneratedFile(filepath);
+    if (pathResult.isGenerated) {
+      return { isGenerated: true, source: 'path' };
+    }
+
+    const gitattributesResult = await this.getGitattributesGeneratedPaths([filepath], ref);
+    if (gitattributesResult.has(filepath)) {
+      return { isGenerated: true, source: 'path' };
+    }
+
+    try {
+      const buffer = await this.getBlobContent(filepath, ref);
+      const lines = this.extractHeaderLines(buffer);
+      const result = isGeneratedFile(filepath, () => lines);
+      return { isGenerated: result.isGenerated, source: 'content' };
+    } catch {
+      return { isGenerated: false, source: 'path' };
+    }
+  }
+
+  async resolveCommitish(commitish: string): Promise<string> {
+    const now = Date.now();
+    const cached = this.resolvedCommitCache.get(commitish);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
+
+    const hash = await this.git.revparse([commitish]);
+    const value = hash.substring(0, 7);
+
+    this.resolvedCommitCache.set(commitish, {
+      value,
+      expiresAt: now + GitDiffParser.RESOLVED_COMMIT_CACHE_TTL_MS,
+    });
+
+    return value;
+  }
+
+  clearResolvedCommitCache(): void {
+    this.resolvedCommitCache.clear();
+  }
+
+  async getDefaultBranch(): Promise<string | null> {
+    try {
+      // Try to get the default branch from origin/HEAD
+      const result = await this.git.raw(['symbolic-ref', 'refs/remotes/origin/HEAD']);
+      // Result will be like "refs/remotes/origin/main\n"
+      const match = result.trim().match(/refs\/remotes\/origin\/(.+)/);
+      if (match) {
+        return match[1];
+      }
+    } catch {
+      // If origin/HEAD is not set, fall back to common default branches
+      const commonDefaults = ['main', 'master'];
+      const branchResult = await this.git.branchLocal();
+      const branchNames = Object.keys(branchResult.branches);
+
+      for (const defaultName of commonDefaults) {
+        if (branchNames.includes(defaultName)) {
+          return defaultName;
+        }
+      }
+    }
+    return null;
+  }
+
+  async getOriginDefaultBranch(): Promise<string | null> {
+    try {
+      const result = await this.git.raw(['symbolic-ref', 'refs/remotes/origin/HEAD']);
+      const match = result.trim().match(/refs\/remotes\/origin\/(.+)/);
+      if (match) {
+        return `origin/${match[1]}`;
+      }
+    } catch {
+      const commonDefaults = ['main', 'master'];
+
+      for (const defaultName of commonDefaults) {
+        try {
+          // No --quiet as simple-git success depends on stderr and that resolves wrong remotes
+          await this.git.raw(['show-ref', '--verify', `refs/remotes/origin/${defaultName}`]);
+          return `origin/${defaultName}`;
+        } catch {
+          // Ignore missing refs and continue checking common defaults.
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async getRevisionOptions(
+    currentBase?: string,
+    currentTarget?: string,
+  ): Promise<{
+    branches: Array<{ name: string; current: boolean }>;
+    commits: Array<{ hash: string; shortHash: string; message: string }>;
+    originDefaultBranch?: string;
+    resolvedBase?: string;
+    resolvedTarget?: string;
+  }> {
+    const [branchResult, logResult, defaultBranch, originDefaultBranch] = await Promise.all([
+      this.git.branchLocal(),
+      this.git.log({ maxCount: 20 }),
+      this.getDefaultBranch(),
+      this.getOriginDefaultBranch(),
+    ]);
+
+    const branches = Object.entries(branchResult.branches).map(([name, data]) => ({
+      name,
+      current: data.current,
+    }));
+
+    // Sort branches: default branch first, then current branch, then alphabetically
+    branches.sort((a, b) => {
+      if (defaultBranch) {
+        if (a.name === defaultBranch) return -1;
+        if (b.name === defaultBranch) return 1;
+      }
+      if (a.current && !b.current) return -1;
+      if (!a.current && b.current) return 1;
+      return a.name.localeCompare(b.name);
+    });
+
+    const commits = logResult.all.map((commit) => ({
+      hash: commit.hash,
+      shortHash: commit.hash.substring(0, 7),
+      message: commit.message,
+    }));
+
+    // Resolve HEAD and HEAD^ to actual commit hashes if they're being used
+    let resolvedBase: string | undefined;
+    let resolvedTarget: string | undefined;
+
+    if (currentBase && !['working', 'staged', '.'].includes(currentBase)) {
+      try {
+        resolvedBase = await this.resolveCommitish(currentBase);
+      } catch {
+        // If resolution fails, leave undefined
+      }
+    }
+
+    if (currentTarget && !['working', 'staged', '.'].includes(currentTarget)) {
+      try {
+        resolvedTarget = await this.resolveCommitish(currentTarget);
+      } catch {
+        // If resolution fails, leave undefined
+      }
+    }
+
+    return {
+      branches,
+      commits,
+      originDefaultBranch: originDefaultBranch ?? undefined,
+      resolvedBase,
+      resolvedTarget,
+    };
+  }
+}
